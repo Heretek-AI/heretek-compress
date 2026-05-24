@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/heretek-error",
+    "crates/heretek-format",
+    "crates/heretek-coder",
+    "crates/heretek-predictor",
+    "crates/heretek-engine",
+]

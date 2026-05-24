@@ -1,0 +1,8 @@
+[package]
+name = "heretek-coder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heretek-error = { path = "../heretek-error" }
+constriction = "0.4"
