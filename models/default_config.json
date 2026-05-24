@@ -1,0 +1,7 @@
+{
+  "num_layers": 8,
+  "embed_dim": 384,
+  "num_heads": 6,
+  "context_window": 513,
+  "vocab_size": 256
+}

@@ -7,4 +7,5 @@ members = [
     "crates/heretek-coder",
     "crates/heretek-predictor",
     "crates/heretek-engine",
+    "crates/heretek-cli",
 ]

@@ -136,7 +136,7 @@ impl<P: Predictor> Decompressor<P> {
 // ---- Free functions --------------------------------------------------------
 
 /// Convenience: compress `input` using `predictor`.
-pub fn compress_to_bytes(input: &[u8], predictor: &impl Predictor) -> Result<Vec<u8>, HeretikError> {
+pub fn compress_to_bytes(input: &[u8], predictor: &dyn Predictor) -> Result<Vec<u8>, HeretikError> {
     // Compressor is unit-like in practice (predictor is borrowed via ref).
     // We take &impl Predictor so callers can pass a reference without
     // consuming the predictor.
@@ -162,7 +162,7 @@ pub fn compress_to_bytes(input: &[u8], predictor: &impl Predictor) -> Result<Vec
 /// Convenience: decompress `compressed` using `predictor`.
 pub fn decompress_from_bytes(
     compressed: &[u8],
-    predictor: &impl Predictor,
+    predictor: &dyn Predictor,)
 ) -> Result<Vec<u8>, HeretikError> {
     if compressed.len() < 60 {
         return Err(FormatError::TruncatedHeader.into());

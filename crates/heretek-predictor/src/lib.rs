@@ -762,4 +762,80 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
     }
+
+    // ---- T02: integration test with Python-exported model ------------------
+
+    /// Load the Python-exported model from models/default.safetensors and
+    /// verify that the forward pass produces valid probability distributions.
+    ///
+    /// This test is the Rust-side smoke test from T02 step 5.
+    #[test]
+    fn load_trained_model_and_verify_distributions() {
+        // Path is relative to the crate root (crates/heretek-predictor).
+        let safetensors_path = std::path::PathBuf::from(
+            env!("CARGO_MANIFEST_DIR"),
+        )
+        .join("../../models/default.safetensors");
+        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/default_config.json");
+
+        // Skip gracefully if the model hasn't been trained yet.
+        if !safetensors_path.exists() {
+            eprintln!(
+                "Skipping test: trained model not found at {}",
+                safetensors_path.display()
+            );
+            return;
+        }
+
+        // Load config JSON.
+        let config_json =
+            std::fs::read_to_string(&config_path).expect("failed to read config JSON");
+        let config: Config =
+            serde_json::from_str(&config_json).expect("failed to parse config JSON");
+
+        // Verify config has the +1 context_window for BOS.
+        assert_eq!(
+            config.context_window,
+            513,
+            "exported model must have context_window=513 (512 + 1 for BOS)"
+        );
+        assert_eq!(config.vocab_size, 256, "vocab_size must be 256");
+
+        // Load model from safetensors buffer.
+        let data = std::fs::read(&safetensors_path).expect("failed to read safetensors file");
+        let model = Transformer::load_from_buffer(&data, &config)
+            .expect("failed to load trained model from buffer");
+
+        // Verify forward pass produces valid distributions on various contexts.
+        for ctx_len in &[1usize, 16, 64, 256, 512] {
+            let ctx: Vec<u8> = (0..*ctx_len).map(|i| (i * 37 + 13) as u8).collect();
+            let dists = model
+                .predict(&ctx)
+                .expect("predict must succeed on trained model");
+            assert_eq!(
+                dists.len(),
+                *ctx_len,
+                "predict must return one row per input byte (len={ctx_len})"
+            );
+
+            for (i, row) in dists.iter().enumerate() {
+                let sum: f32 = row.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 0.01,
+                    "row {i} sum {sum} not within 0.01 of 1.0 (ctx_len={ctx_len})"
+                );
+            }
+        }
+
+        // Verify predict_single.
+        let single = model
+            .predict_single(&[10, 20, 30, 40])
+            .expect("predict_single must succeed");
+        let sum: f32 = single.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "predict_single sum {sum} not within 0.01 of 1.0"
+        );
+    }
 }
