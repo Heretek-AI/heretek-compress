@@ -162,7 +162,7 @@ pub fn compress_to_bytes(input: &[u8], predictor: &dyn Predictor) -> Result<Vec<
 /// Convenience: decompress `compressed` using `predictor`.
 pub fn decompress_from_bytes(
     compressed: &[u8],
-    predictor: &dyn Predictor,)
+    predictor: &dyn Predictor,
 ) -> Result<Vec<u8>, HeretikError> {
     if compressed.len() < 60 {
         return Err(FormatError::TruncatedHeader.into());
