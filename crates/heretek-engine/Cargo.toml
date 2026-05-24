@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 heretek-error = { path = "../heretek-error" }
+heretek-format = { path = "../heretek-format" }
+heretek-coder = { path = "../heretek-coder" }
+heretek-predictor = { path = "../heretek-predictor" }
+sha2 = "0.10"
+
+[dev-dependencies]
+proptest = "1"

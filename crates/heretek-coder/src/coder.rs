@@ -7,54 +7,60 @@ use heretek_error::CoderError;
 /// them in reverse at `finish_encode()`, so the caller can feed symbols in
 /// logical (forward) order.
 ///
-/// Currently supports i.i.d. encoding (all symbols share the same model).
+/// Supports both i.i.d. (same model for all symbols) and heterogeneous
+/// (per-symbol) probability distributions.  For i.i.d. use the existing
+/// `encode`/`decode`/`decode_symbol` methods; for heterogeneous per-symbol
+/// models call `encode(probs, symbol)` with a different `probs` for each
+/// position and then call `decode_symbol` with the corresponding model
+/// at decode time.
 pub struct AnsCoder {
     inner: constriction::stream::stack::DefaultAnsCoder,
-    /// Symbols accumulated in encode order; flushed in reverse at finish.
-    symbols: Vec<usize>,
-    /// Cached model (set on first encode, shared across all symbols).
-    model_probs: Option<[f32; 256]>,
+    /// Buffered (symbol, probability-distribution) pairs in encode order.
+    buffer: Vec<(u8, [f32; 256])>,
 }
+
+/// Alias for a constriction entropy model built from f32 probabilities.
+type EntropyModel = constriction::stream::model::DefaultContiguousCategoricalEntropyModel;
 
 impl AnsCoder {
     pub fn new() -> Self {
         Self {
             inner: constriction::stream::stack::DefaultAnsCoder::new(),
-            symbols: Vec::new(),
-            model_probs: None,
+            buffer: Vec::new(),
         }
     }
 
+    /// Encode a single symbol with a specific probability distribution.
+    ///
+    /// Each call may supply a different `probs` array — heterogeneous
+    /// per-symbol encoding is fully supported.
     pub fn encode(&mut self, probs: &[f32; 256], symbol: u8) -> Result<(), CoderError> {
-        match &self.model_probs {
-            Some(cached) if cached == probs => {}
-            Some(_) => {
-                return Err(CoderError::EncodeFailed {
-                    message: "heterogeneous per-symbol models not yet supported".into(),
-                });
-            }
-            None => {
-                self.model_probs = Some(*probs);
-            }
-        }
-        self.symbols.push(symbol as usize);
+        self.buffer.push((symbol, *probs));
         Ok(())
     }
 
+    /// Finish encoding and return the compressed word stream.
+    ///
+    /// Uses `encode_symbols_reverse` so per-symbol probability models are
+    /// paired with their corresponding symbols.
     pub fn finish_encode(mut self) -> Result<Vec<u32>, CoderError> {
-        let probs: [f32; 256] =
-            self.model_probs.unwrap_or([1.0f32 / 256.0; 256]);
+        if self.buffer.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let model = constriction::stream::model::DefaultContiguousCategoricalEntropyModel
-            ::from_floating_point_probabilities_fast(&probs, None)
-            .map_err(|e| CoderError::EncodeFailed {
-                message: format!("model build failed: {e:?}"),
-            })?;
+        // Build one entropy model per buffered symbol.
+        let models: Vec<EntropyModel> = self
+            .buffer
+            .iter()
+            .map(|(_, probs)| build_encoder_model(probs))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // encode_iid_symbols_reverse handles stack reversal internally —
-        // we pass symbols in forward order and it encodes from last to first.
+        let symbols: Vec<usize> = self.buffer.iter().map(|(s, _)| *s as usize).collect();
+
+        // encode_symbols_reverse handles stack reversal internally: we pass
+        // symbols in forward order and constriction encodes from last to first.
         self.inner
-            .encode_iid_symbols_reverse(&self.symbols, &model)
+            .encode_symbols_reverse(symbols.into_iter().zip(models.into_iter()))
             .map_err(|e| CoderError::EncodeFailed {
                 message: format!("ANS encode failed: {e:?}"),
             })?;
@@ -62,6 +68,7 @@ impl AnsCoder {
         Ok(self.inner.into_compressed().unwrap_or_default())
     }
 
+    /// Initialise a decoder from previously encoded words.
     pub fn start_decode(words: &[u32]) -> Result<Self, CoderError> {
         let inner =
             constriction::stream::stack::DefaultAnsCoder::from_compressed(words.to_vec())
@@ -70,21 +77,33 @@ impl AnsCoder {
                 })?;
         Ok(Self {
             inner,
-            symbols: Vec::new(),
-            model_probs: None,
+            buffer: Vec::new(),
         })
     }
 
+    /// Decode a single symbol using the given probability distribution.
+    ///
+    /// For heterogeneous decoding, call once per expected output symbol with
+    /// the same per-position model that was used during encoding.
+    pub fn decode_symbol(&mut self, probs: &[f32; 256]) -> Result<u8, CoderError> {
+        use constriction::stream::Decode;
+        let model = build_decoder_model(probs)?;
+        let symbol: usize = self.inner.decode_symbol(model).map_err(|e| {
+            CoderError::DecodeFailed {
+                message: format!("ANS decode_symbol failed: {e:?}"),
+            }
+        })?;
+        Ok(symbol as u8)
+    }
+
+    /// Decode `amount` symbols with the same i.i.d. model (convenience
+    /// wrapper for the common uniform/single-model case).
     pub fn decode(&mut self, probs: &[f32; 256], amount: usize) -> Result<Vec<u8>, CoderError> {
         if amount == 0 {
             return Ok(Vec::new());
         }
 
-        let model = constriction::stream::model::DefaultContiguousCategoricalEntropyModel
-            ::from_floating_point_probabilities_fast(probs, None)
-            .map_err(|e| CoderError::DecodeFailed {
-                message: format!("model build failed: {e:?}"),
-            })?;
+        let model = build_decoder_model(probs)?;
 
         use constriction::stream::Decode;
         let decoded: Vec<usize> = self
@@ -97,6 +116,24 @@ impl AnsCoder {
 
         Ok(decoded.into_iter().map(|s| s as u8).collect())
     }
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+fn build_encoder_model(probs: &[f32; 256]) -> Result<EntropyModel, CoderError> {
+    EntropyModel::from_floating_point_probabilities_fast(probs, None).map_err(|e| {
+        CoderError::EncodeFailed {
+            message: format!("model build failed: {e:?}"),
+        }
+    })
+}
+
+fn build_decoder_model(probs: &[f32; 256]) -> Result<EntropyModel, CoderError> {
+    EntropyModel::from_floating_point_probabilities_fast(probs, None).map_err(|e| {
+        CoderError::DecodeFailed {
+            message: format!("model build failed: {e:?}"),
+        }
+    })
 }
 
 impl Default for AnsCoder {
@@ -223,6 +260,61 @@ mod tests {
         let compressed = encoder.finish_encode().unwrap();
         let mut decoder = AnsCoder::start_decode(&compressed).unwrap();
         let recovered = decoder.decode(&probs, data.len()).unwrap();
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn heterogeneous_per_symbol_round_trip() {
+        let probs: Vec<[f32; 256]> = (0..100)
+            .map(|i| {
+                let mut p = [1.0f32 / 256.0; 256];
+                // Slightly bias toward symbol i%256 each position.
+                p[i % 256] = 20.0 / 256.0;
+                let sum: f32 = p.iter().sum();
+                for v in &mut p {
+                    *v /= sum;
+                }
+                p
+            })
+            .collect();
+
+        let data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
+
+        let mut encoder = AnsCoder::new();
+        for (byte, dist) in data.iter().zip(probs.iter()) {
+            encoder.encode(dist, *byte).unwrap();
+        }
+        let compressed = encoder.finish_encode().unwrap();
+
+        let mut decoder = AnsCoder::start_decode(&compressed).unwrap();
+        let mut recovered = Vec::with_capacity(100);
+        for dist in &probs {
+            let s = decoder.decode_symbol(dist).unwrap();
+            recovered.push(s);
+        }
+        assert_eq!(recovered, data);
+    }
+
+    #[test]
+    fn heterogeneous_produces_same_as_iid_when_uniform() {
+        // When all per-symbol models are identical, heterogeneous encoding
+        // should produce byte-identical output to i.i.d. encoding.
+        let uniform = uniform_probs();
+        let data: Vec<u8> = b"hello world, this is a test".to_vec();
+
+        // i.i.d. path
+        let mut enc = AnsCoder::new();
+        for &b in &data {
+            enc.encode(&uniform, b).unwrap();
+        }
+        let iid_compressed = enc.finish_encode().unwrap();
+
+        // Same but via decode_symbol per-byte
+        let mut dec = AnsCoder::start_decode(&iid_compressed).unwrap();
+        let mut recovered = Vec::with_capacity(data.len());
+        for _ in 0..data.len() {
+            recovered.push(dec.decode_symbol(&uniform).unwrap());
+        }
         assert_eq!(recovered, data);
     }
 }
