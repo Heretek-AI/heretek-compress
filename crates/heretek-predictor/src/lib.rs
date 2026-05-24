@@ -149,7 +149,8 @@ impl DecoderLayer {
 /// Byte-level autoregressive transformer (decoder-only).
 ///
 /// Created either with random initialisation (`Transformer::new`) or loaded
-/// from safetensors checkpoint files (`Transformer::load`).  Implements
+/// from safetensors checkpoint files (`Transformer::load`) or from an
+/// in-memory buffer (`Transformer::load_from_buffer`).  Implements
 /// [`Predictor`] so it slots directly into the heretek-engine pipeline.
 pub struct Transformer {
     config: Config,
@@ -159,17 +160,25 @@ pub struct Transformer {
     norm: LayerNorm,
     output_proj: Linear,
     device: Device,
+    /// Retained for `save()` — only `Some` when the model was created via
+    /// `Transformer::new()`.  `None` when loaded from a buffer or mmap file.
+    varmap: Option<VarMap>,
 }
 
 impl Transformer {
     /// Create a transformer with random (Xavier-like) initialisation.
+    ///
+    /// The returned model retains a [`VarMap`] that can be persisted via
+    /// [`Transformer::save`].
     pub fn new(config: &Config) -> candle_core::Result<Self> {
         let device = Device::Cpu;
         let dtype = DType::F32;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, dtype, &device);
 
-        Self::build(config, vb, device)
+        let mut model = Self::build(config, vb, device)?;
+        model.varmap = Some(varmap);
+        Ok(model)
     }
 
     /// Load a transformer from one or more safetensors files.
@@ -186,7 +195,49 @@ impl Transformer {
         Self::build(config, vb, device)
     }
 
-    /// Shared construction logic used by both `new` and `load`.
+    /// Load a transformer from an in-memory safetensors buffer.
+    ///
+    /// This is the safe loading path — the buffer is fully parsed upfront
+    /// and no mmap is used.  Suitable for `include_bytes!` embedding and
+    /// general use where mmap is undesirable.
+    ///
+    /// Models loaded via this path **cannot** be saved back (no `VarMap`
+    /// is retained).
+    pub fn load_from_buffer(data: &[u8], config: &Config) -> Result<Self, PredictorError> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let vb = VarBuilder::from_slice_safetensors(data, dtype, &device).map_err(|e| {
+            PredictorError::ModelLoadFailed {
+                path: "<buffer>".to_string(),
+                message: format!("failed to parse safetensors from buffer: {e}"),
+            }
+        })?;
+
+        Self::build(config, vb, device).map_err(|e| PredictorError::ModelLoadFailed {
+            path: "<buffer>".to_string(),
+            message: format!("build from buffer: {e}"),
+        })
+    }
+
+    /// Save the model weights to a safetensors file.
+    ///
+    /// Only available when the model was created with [`Transformer::new`].
+    /// Returns an error if the model was loaded from a buffer or mmap file
+    /// (no `VarMap` retained).
+    pub fn save(&self, path: &Path) -> Result<(), PredictorError> {
+        let varmap = self.varmap.as_ref().ok_or_else(|| {
+            PredictorError::ModelLoadFailed {
+                path: path.display().to_string(),
+                message: "cannot save a model that was loaded from a buffer or file".to_string(),
+            }
+        })?;
+        varmap.save(path).map_err(|e| PredictorError::ModelLoadFailed {
+            path: path.display().to_string(),
+            message: format!("failed to save safetensors: {e}"),
+        })
+    }
+
+    /// Shared construction logic used by `new`, `load`, and `load_from_buffer`.
     fn build(config: &Config, vb: VarBuilder, device: Device) -> candle_core::Result<Self> {
         if config.embed_dim % config.num_heads != 0 {
             candle_core::bail!(
@@ -253,6 +304,7 @@ impl Transformer {
             norm,
             output_proj,
             device,
+            varmap: None,
         })
     }
 
@@ -559,5 +611,155 @@ mod tests {
         assert_send_sync::<StubPredictor>();
         // Transformer is also Send+Sync because candle types are.
         assert_send_sync::<Transformer>();
+    }
+
+    // ----------------------------------------------------------------- save / load_from_buffer tests
+
+    /// Create a tiny config so model construction and prediction is fast.
+    fn tiny_config() -> Config {
+        Config {
+            num_layers: 1,
+            embed_dim: 32,
+            num_heads: 2,
+            context_window: 64,
+            vocab_size: 256,
+        }
+    }
+
+    /// Predictions for a fixed context — used as a fingerprint to verify
+    /// that different loading paths produce identical outputs.
+    fn predict_fingerprint(model: &Transformer) -> Vec<[f32; 256]> {
+        let ctx: Vec<u8> = (0..20).map(|i| (i * 13 + 7) as u8).collect();
+        model.predict(&ctx).unwrap()
+    }
+
+    #[test]
+    fn save_and_load_from_buffer_round_trip() {
+        let config = tiny_config();
+        let model = Transformer::new(&config).unwrap();
+
+        // Capture predictions from the fresh model.
+        let fresh_fingerprint = predict_fingerprint(&model);
+
+        // Save to a temp file.
+        let tmp = std::env::temp_dir().join(format!(
+            "heretek_t01_roundtrip_{}.safetensors",
+            std::process::id()
+        ));
+        model.save(&tmp).unwrap();
+
+        // Read the saved file into a buffer.
+        let data = std::fs::read(&tmp).unwrap();
+
+        // Load from buffer.
+        let reloaded = Transformer::load_from_buffer(&data, &config).unwrap();
+        let reloaded_fingerprint = predict_fingerprint(&reloaded);
+
+        // Predictions must match exactly.
+        assert_eq!(
+            fresh_fingerprint.len(),
+            reloaded_fingerprint.len(),
+            "fingerprint lengths must match"
+        );
+        for (i, (a, b)) in fresh_fingerprint
+            .iter()
+            .zip(reloaded_fingerprint.iter())
+            .enumerate()
+        {
+            for (j, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (va - vb).abs() < 1e-6,
+                    "mismatch at position ({i}, class {j}): fresh={va}, reloaded={vb}"
+                );
+            }
+        }
+
+        // Clean up.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn corrupted_buffer_is_rejected() {
+        let config = tiny_config();
+        // Feed invalid safetensors data (just random bytes, not a valid header).
+        let garbage: Vec<u8> = (0..256).map(|i| i as u8).collect();
+        let result = Transformer::load_from_buffer(&garbage, &config);
+        assert!(
+            result.is_err(),
+            "load_from_buffer must reject corrupted data"
+        );
+    }
+
+    #[test]
+    fn save_on_buffer_loaded_model_returns_error() {
+        let config = tiny_config();
+        let model = Transformer::new(&config).unwrap();
+
+        // Save to temp, read back, load from buffer.
+        let tmp = std::env::temp_dir().join(format!(
+            "heretek_t01_save_error_{}.safetensors",
+            std::process::id()
+        ));
+        model.save(&tmp).unwrap();
+        let data = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let buffer_model = Transformer::load_from_buffer(&data, &config).unwrap();
+
+        // Attempting to save should fail.
+        let out_path = std::env::temp_dir().join(format!(
+            "heretek_t01_should_not_exist_{}.safetensors",
+            std::process::id()
+        ));
+        let result = buffer_model.save(&out_path);
+        assert!(
+            result.is_err(),
+            "save on buffer-loaded model must return an error"
+        );
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn load_from_buffer_rejects_mismatched_config() {
+        let config = tiny_config();
+        let model = Transformer::new(&config).unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "heretek_t01_cfgchk_{}.safetensors",
+            std::process::id()
+        ));
+        model.save(&tmp).unwrap();
+        let data = std::fs::read(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // Use a config with different embed_dim — the tensor shapes won't match.
+        let bad_config = Config {
+            embed_dim: 64, // original was 32
+            ..config
+        };
+        let result = Transformer::load_from_buffer(&data, &bad_config);
+        assert!(
+            result.is_err(),
+            "load_from_buffer must reject config with incompatible shapes"
+        );
+    }
+
+    #[test]
+    fn new_model_can_save() {
+        let config = tiny_config();
+        let model = Transformer::new(&config).unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "heretek_t01_new_save_{}.safetensors",
+            std::process::id()
+        ));
+        let result = model.save(&tmp);
+        assert!(result.is_ok(), "new model must be savable: {result:?}");
+
+        // Verify the file exists and is non-empty.
+        let meta = std::fs::metadata(&tmp).unwrap();
+        assert!(meta.len() > 0, "saved file must be non-empty");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
